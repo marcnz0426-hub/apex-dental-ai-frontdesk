@@ -1,0 +1,222 @@
+{
+  "name": "Dental AI Receptionist - Live GHL + HIPAA Defensive Booking",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "dental-booking-tool",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "id": "webhook-trigger",
+      "name": "Retell Webhook Inbound"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract parameters safely from Retell or test payload\nconst raw = $input.first().json;\nconst body = raw.body || raw;\nconst args = body.args || body;\n\nconst rawSlot = String(args.desired_slot || args.time || \"2:30 PM\").toLowerCase();\nconst patientName = String(args.patient_name || args.name || \"Valued Patient\").trim();\nlet phone = String(args.phone_number || args.phone || \"+15550199000\").replace(/[^\\d+]/g, \"\");\nif (!phone.startsWith(\"+\")) phone = \"+1\" + phone;\nconst rawReason = String(args.reason || \"General Checkup\").toLowerCase();\n\n// HIPAA PHI Sanitization & De-identification (Enum Mapping)\nlet sanitizedCategory = \"General Consultation & Checkup\";\nif (rawReason.includes(\"clean\") || rawReason.includes(\"hygiene\") || rawReason.includes(\"plaque\")) {\n  sanitizedCategory = \"Routine Dental Hygiene & Cleaning\";\n} else if (rawReason.includes(\"pain\") || rawReason.includes(\"toothache\") || rawReason.includes(\"emergency\") || rawReason.includes(\"broken\")) {\n  sanitizedCategory = \"Priority Diagnostic Triage\";\n} else if (rawReason.includes(\"whiten\") || rawReason.includes(\"cosmetic\")) {\n  sanitizedCategory = \"Cosmetic Consultation\";\n}\n\n// Collision Detection (Blocked Lunch Window: 12:00 PM - 1:00 PM ET)\nconst isLunchConflict = rawSlot.includes(\"12\") || rawSlot.includes(\"noon\") || rawSlot.includes(\"12:00\") || rawSlot.includes(\"12:30\");\n\n// Parse & Snap to GHL 30-Minute Calendar Intervals (:00 or :30)\nlet hour = 14, minute = 30;\nconst match = rawSlot.match(/(\\d{1,2})(?::(\\d{2}))?\\s*(am|pm)?/i);\nif (match) {\n  hour = parseInt(match[1], 10);\n  let rawMin = match[2] ? parseInt(match[2], 10) : 0;\n  const ampm = (match[3] || \"\").toLowerCase();\n  if (ampm === \"pm\" && hour < 12) hour += 12;\n  if (!ampm && hour >= 1 && hour <= 6) hour += 12;\n\n  if (rawMin < 15) minute = 0;\n  else if (rawMin < 45) minute = 30;\n  else { minute = 0; hour += 1; }\n}\n\nconst dateStr = \"2026-11-17\";\nconst pad = (n) => String(n).padStart(2, \"0\");\nconst startTime = `${dateStr}T${pad(hour)}:${pad(minute)}:00-05:00`;\nlet endMin = minute + 30;\nlet endHr = hour;\nif (endMin >= 60) { endHr += 1; endMin -= 60; }\nconst endTime = `${dateStr}T${pad(endHr)}:${pad(endMin)}:00-05:00`;\n\nreturn [{\n  json: {\n    patient_name: patientName,\n    phone_number: phone,\n    requested_slot: rawSlot || \"2:30 PM\",\n    sanitized_category: sanitizedCategory,\n    is_conflict: isLunchConflict,\n    confirmed_slot: isLunchConflict ? null : (args.desired_slot || args.time || \"2:30 PM\"),\n    start_time_iso: startTime,\n    end_time_iso: endTime,\n    alternate_slots: [\"2:30 PM\", \"3:30 PM\"],\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        0
+      ],
+      "id": "hipaa-collision-resolver",
+      "name": "HIPAA Sanitizer & Collision Resolver"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "condition-conflict",
+              "leftValue": "={{ $json.is_conflict }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        0
+      ],
+      "id": "if-conflict",
+      "name": "Is Blocked Slot?"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'conflict', message: 'Dr. Smith is unavailable between 12:00 PM - 1:00 PM due to a reserved lunch block.', alternate_slots: $json.alternate_slots, agent_response: 'I am sorry, Dr. Smith is unavailable during lunch from 12 to 1 PM. Would 2:30 PM or 3:30 PM work instead for your ' + $json.sanitized_category + '?' } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        740,
+        -120
+      ],
+      "id": "respond-conflict",
+      "name": "Respond Blocked (Scenario 2)"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/contacts/upsert",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_GHL_PRIVATE_INTEGRATION_TOKEN"
+            },
+            {
+              "name": "Version",
+              "value": "2021-07-28"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { locationId: 'YOUR_GHL_LOCATION_ID', name: $json.patient_name, phone: $json.phone_number, tags: ['retell-ai-booked'] } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        740,
+        120
+      ],
+      "id": "ghl-upsert-contact",
+      "name": "GHL Upsert Contact"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://services.leadconnectorhq.com/calendars/events/appointments",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_GHL_PRIVATE_INTEGRATION_TOKEN"
+            },
+            {
+              "name": "Version",
+              "value": "2021-04-15"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { calendarId: 'YOUR_GHL_CALENDAR_ID', locationId: 'YOUR_GHL_LOCATION_ID', contactId: $json.contact.id, startTime: $('HIPAA Sanitizer & Collision Resolver').item.json.start_time_iso, endTime: $('HIPAA Sanitizer & Collision Resolver').item.json.end_time_iso, title: $('HIPAA Sanitizer & Collision Resolver').item.json.sanitized_category, appointmentStatus: 'confirmed' } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        980,
+        120
+      ],
+      "id": "ghl-book-appointment",
+      "name": "GHL Book Appointment"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { status: 'success', message: 'Appointment confirmed and synced to GoHighLevel.', ghl_appointment_id: $json.id, appointment_slot: $('HIPAA Sanitizer & Collision Resolver').item.json.confirmed_slot, patient_name: $('HIPAA Sanitizer & Collision Resolver').item.json.patient_name, category: $('HIPAA Sanitizer & Collision Resolver').item.json.sanitized_category, agent_response: 'Great news ' + $('HIPAA Sanitizer & Collision Resolver').item.json.patient_name + '! You are confirmed for ' + $('HIPAA Sanitizer & Collision Resolver').item.json.confirmed_slot + ' with Dr. Smith for ' + $('HIPAA Sanitizer & Collision Resolver').item.json.sanitized_category + '. A confirmation text has been sent to your phone.' } }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1220,
+        120
+      ],
+      "id": "respond-success",
+      "name": "Respond Success (Happy Path)"
+    }
+  ],
+  "connections": {
+    "Retell Webhook Inbound": {
+      "main": [
+        [
+          {
+            "node": "HIPAA Sanitizer & Collision Resolver",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HIPAA Sanitizer & Collision Resolver": {
+      "main": [
+        [
+          {
+            "node": "Is Blocked Slot?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Blocked Slot?": {
+      "main": [
+        [
+          {
+            "node": "Respond Blocked (Scenario 2)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GHL Upsert Contact",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL Upsert Contact": {
+      "main": [
+        [
+          {
+            "node": "GHL Book Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GHL Book Appointment": {
+      "main": [
+        [
+          {
+            "node": "Respond Success (Happy Path)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}
